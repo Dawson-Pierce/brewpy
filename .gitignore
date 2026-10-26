@@ -1,0 +1,11 @@
+build/
+build-*/
+dependencies/
+output/
+.venv/
+__pycache__/
+*.so
+*.pyd
+*.pyc
+*.egg-info/
+bindings_generated.cpp

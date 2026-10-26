@@ -1,0 +1,339 @@
+// Static prelude for the auto-generated brewpy module: the `latest` helper used by every RFS
+// tracker, plus brewpy_static_extra() which hand-binds fusion and template-matching helpers.
+#include "brew/ggiw/gci.hpp"
+#include "brew/usggiw/gci.hpp"
+#include "brew/iggiw/gci.hpp"
+#include "brew/trajectory_ggiw/trajectory_ggiw_model.hpp"
+#include "brew/trajectory_ggiw/filters/trajectory_ggiw_ekf.hpp"
+#include "brew/trajectory_ggiw/multi_target/phd.hpp"
+#include "brew/trajectory_usggiw/trajectory_usggiw_model.hpp"
+#include "brew/trajectory_usggiw/filters/trajectory_usggiw_ekf.hpp"
+#include "brew/trajectory_usggiw/multi_target/phd.hpp"
+#include "brew/template_matching/icp_base.hpp"
+#include "brew/template_matching/pca_icp.hpp"
+#include "brew/template_matching/point_cloud.hpp"
+#include "brew/template_matching/point_to_plane_icp.hpp"
+#include "brew/template_matching/point_to_point_icp.hpp"
+#include "brew/template_matching/template_library.hpp"
+#include "brew/desktop/measurement_sampling/measurement_sampling.hpp"
+#include "brew/shared/fusion/arithmetic_average.hpp"
+
+// Adapts a fixed-state DynamicsBase<T, N> implementation to the dynamic-state base
+// used by the generated Python filters. Header metadata selects this adapter, so no
+// dynamics class names are hard-coded in the generator.
+template <typename FixedDynamics>
+class BrewpyDynamicsAdapter : public dynamics::DynamicsBase<> {
+ public:
+  BrewpyDynamicsAdapter() = default;
+
+  template <typename... Args>
+  explicit BrewpyDynamicsAdapter(Args&&... args)
+      : implementation_(std::forward<Args>(args)...) {}
+
+  [[nodiscard]] std::unique_ptr<dynamics::DynamicsBase<>> clone() const override {
+    return std::make_unique<BrewpyDynamicsAdapter>(*this);
+  }
+
+  [[nodiscard]] std::vector<std::string> state_names() const override {
+    return implementation_.state_names();
+  }
+
+  [[nodiscard]] Eigen::VectorXd propagate_state(
+      double dt, const Eigen::VectorXd& state,
+      const Eigen::VectorXd& input = Eigen::VectorXd{}) const override {
+    typename FixedDynamics::Vector fixed_state = checked_state(state);
+    return implementation_.propagate_state(dt, fixed_state, input);
+  }
+
+  [[nodiscard]] Eigen::MatrixXd get_state_mat(
+      double dt, const Eigen::VectorXd& state = Eigen::VectorXd{}) const override {
+    typename FixedDynamics::Vector fixed_state = checked_state(state);
+    return implementation_.get_state_mat(dt, fixed_state);
+  }
+
+  [[nodiscard]] Eigen::MatrixXd get_input_mat(
+      double dt, const Eigen::VectorXd& state = Eigen::VectorXd{}) const override {
+    typename FixedDynamics::Vector fixed_state = checked_state(state);
+    return implementation_.get_input_mat(dt, fixed_state);
+  }
+
+  [[nodiscard]] Eigen::MatrixXd propagate_extent(
+      double dt, const Eigen::VectorXd& state,
+      const Eigen::MatrixXd& extent) const override {
+    typename FixedDynamics::Vector fixed_state = checked_state(state);
+    return implementation_.propagate_extent(dt, fixed_state, extent);
+  }
+
+  [[nodiscard]] bool is_lti() const override { return implementation_.is_lti(); }
+
+ private:
+  [[nodiscard]] typename FixedDynamics::Vector checked_state(
+      const Eigen::VectorXd& state) const {
+    if (state.size() == 0) {
+      typename FixedDynamics::Vector zero;
+      zero.setZero();
+      return zero;
+    }
+    if (state.size() != static_cast<Eigen::Index>(state_names().size())) {
+      throw std::invalid_argument("Dynamics state has the wrong dimension.");
+    }
+    return state;
+  }
+
+  FixedDynamics implementation_;
+};
+
+// Latest extracted mixture (owning clone) or empty. unique_ptr so pybind takes ownership
+// (Mixture holds unique_ptrs and is non-copyable -> a by-value return is ill-formed).
+template <typename Filt, typename Mix>
+static std::unique_ptr<Mix> brewpy_latest(const Filt& f) {
+  if (f.extracted_mixtures().empty()) return std::make_unique<Mix>();
+  return f.extracted_mixtures().back()->clone();
+}
+
+template <typename GG, typename US, typename IG>
+static void brewpy_bind_fusion(py::module_& ggiw_mod, py::module_& usggiw_mod, py::module_& iggiw_mod) {
+  using GGMix = models::Mixture<GG>;
+  using USMix = models::Mixture<US>;
+  using IGMix = models::Mixture<IG>;
+  ggiw_mod.def("gci", [](const std::vector<GGMix*>& mx, std::vector<double> w, double pt) {
+                 std::vector<const GGMix*> s(mx.begin(), mx.end());
+                 return std::make_unique<GGMix>(ggiw::gci(s, std::move(w), pt));
+               }, py::arg("sources"), py::arg("weights") = std::vector<double>{},
+               py::arg("prune_threshold") = 0.0);
+  ggiw_mod.def("arithmetic_average", [](const std::vector<GGMix*>& mx, std::vector<double> w) {
+                 std::vector<const GGMix*> s(mx.begin(), mx.end());
+                 return std::make_unique<GGMix>(fusion::arithmetic_average<GG>(s, std::move(w)));
+               }, py::arg("sources"), py::arg("weights") = std::vector<double>{});
+  usggiw_mod.def("gci", [](const std::vector<USMix*>& mx, std::vector<double> w, double pt) {
+                  std::vector<const USMix*> s(mx.begin(), mx.end());
+                  return std::make_unique<USMix>(usggiw::gci(s, std::move(w), pt));
+                }, py::arg("sources"), py::arg("weights") = std::vector<double>{},
+                py::arg("prune_threshold") = 0.0);
+  iggiw_mod.def("gci", [](const std::vector<IGMix*>& mx, std::vector<double> w, double pt) {
+                  std::vector<const IGMix*> s(mx.begin(), mx.end());
+                  return std::make_unique<IGMix>(iggiw::gci(s, std::move(w), pt));
+                }, py::arg("sources"), py::arg("weights") = std::vector<double>{},
+                py::arg("prune_threshold") = 0.0);
+  iggiw_mod.def("arithmetic_average", [](const std::vector<IGMix*>& mx, std::vector<double> w) {
+                  std::vector<const IGMix*> s(mx.begin(), mx.end());
+                  return std::make_unique<IGMix>(fusion::arithmetic_average<IG>(s, std::move(w)));
+                }, py::arg("sources"), py::arg("weights") = std::vector<double>{});
+}
+
+// Trajectory GGIW-PHD: the generic generator skips trajectory models (their stacked-window accessors
+// don't fit the single-state binder), so bind exactly what the ground station needs by hand -- the
+// TrajectoryGGIW model + mixture, its EKF, and the
+// trajectory_ggiw PHD (with the observability field + set_measurement_components).
+static void brewpy_bind_trajectory_ggiw(py::module_& m) {
+  using GG   = models::GGIW<>;
+  using TG   = models::TrajectoryGGIW<>;
+  using TGMix = models::Mixture<TG>;
+  using GGMix = models::Mixture<GG>;
+  using EKF  = filters::TrajectoryGGIWEKF<>;
+  using TPHD = trajectory_ggiw::PHD<>;
+
+  auto mdl = m.def_submodule("models");
+  py::class_<TG>(mdl, "TrajectoryGGIW")
+      .def(py::init([](int state_dim, const GG& initial, int max_window) {
+             return TG(state_dim, initial, max_window);
+           }), py::arg("state_dim"), py::arg("initial"), py::arg("max_window") = 5)
+      .def("current", [](const TG& t) { return t.current(); })   // latest GGIW state (pos, extent, rate)
+      .def("state_history_means", [](const TG& t) { return Eigen::MatrixXd(t.state_history_means()); })
+      .def("window_size", &TG::window_size);
+  py::class_<TGMix>(mdl, "TrajectoryGGIWMixture")
+      .def(py::init<>())
+      .def("add_component", [](TGMix& mx, const TG& c, double w) { mx.add_component(TG(c), w); },
+           py::arg("component"), py::arg("weight"))
+      .def("size", &TGMix::size).def("__len__", &TGMix::size)
+      .def("weight", &TGMix::weight, py::arg("i"))
+      .def("component", [](TGMix& mx, std::size_t i) -> TG& { return mx.component(i); },
+           py::arg("i"), py::return_value_policy::reference_internal);
+
+  // NOTE: filters::TrajectoryGGIWEKF is bound by the generated emit_filters.
+  // do NOT re-bind it here or pybind errors on a duplicate type registration.
+
+  auto tg = m.def_submodule("trajectory_ggiw");
+  py::class_<TPHD>(tg, "PHD")
+      .def(py::init<>())
+      .def("set_filter", [](TPHD& p, const EKF& f) { p.set_filter(f.clone()); }, py::arg("filter"))
+      .def("set_birth_model", [](TPHD& p, const TGMix& b) { p.set_birth_model(b.clone()); }, py::arg("birth"))
+      .def("set_intensity", [](TPHD& p, const TGMix& i) { p.set_intensity(i.clone()); }, py::arg("intensity"))
+      .def("set_measurement_components", [](TPHD& p, const GGMix& z) { p.set_measurement_components(z); }, py::arg("z"))
+      .def("set_detection_field", [](TPHD& p, const Eigen::MatrixXd& field, double radius, double pd_out)
+           { p.set_detection_field(field, radius, pd_out); }, py::arg("field"), py::arg("radius"), py::arg("pd_out"))
+      .def("set_prob_detection", &TPHD::set_prob_detection, py::arg("pd"))
+      .def("set_prob_survive", &TPHD::set_prob_survive, py::arg("ps"))
+      .def("set_clutter_rate", &TPHD::set_clutter_rate, py::arg("rate"))
+      .def("set_clutter_density", &TPHD::set_clutter_density, py::arg("density"))
+      .def("set_extract_threshold", &TPHD::set_extract_threshold, py::arg("t"))
+      .def("set_prune_threshold", &TPHD::set_prune_threshold, py::arg("t"))
+      .def("set_merge_threshold", &TPHD::set_merge_threshold, py::arg("t"))
+      .def("set_max_components", &TPHD::set_max_components, py::arg("n"))
+      .def("set_gate_threshold", &TPHD::set_gate_threshold, py::arg("t"))
+      .def("predict", [](TPHD& p, int f, double dt) { p.predict(f, dt); }, py::arg("frame"), py::arg("dt"))
+      .def("correct", [](TPHD& p, const Eigen::MatrixXd& z) { p.correct(z); }, py::arg("measurements"))
+      .def("cleanup", &TPHD::cleanup)
+      .def("latest", [](TPHD& p) { return brewpy_latest<TPHD, TGMix>(p); });
+}
+
+static void brewpy_bind_trajectory_usggiw(py::module_& m) {
+  using US = models::USGGIW<>;
+  using TUS = models::TrajectoryUSGGIW<>;
+  using TUSMix = models::Mixture<TUS>;
+  using USMix = models::Mixture<US>;
+  using EKF = filters::TrajectoryUSGGIWEKF<>;
+  using TPHD = trajectory_usggiw::PHD<>;
+
+  auto mdl = m.def_submodule("models");
+  py::class_<TUS>(mdl, "TrajectoryUSGGIW")
+      .def(py::init([](int state_dim, const US& initial, int max_window) {
+             return TUS(state_dim, initial, max_window);
+           }), py::arg("state_dim"), py::arg("initial"), py::arg("max_window") = 5)
+      .def("current", [](const TUS& trajectory) { return trajectory.current(); })
+      .def("state_history_directions", [](const TUS& trajectory) {
+             return Eigen::MatrixXd(trajectory.state_history_directions());
+           })
+      .def("state_history_angular_velocities", [](const TUS& trajectory) {
+             return Eigen::MatrixXd(trajectory.state_history_angular_velocities());
+           })
+      .def("window_directions", [](const TUS& trajectory) {
+             return Eigen::MatrixXd(trajectory.window_directions());
+           })
+      .def("window_angular_velocities", [](const TUS& trajectory) {
+             return Eigen::MatrixXd(trajectory.window_angular_velocities());
+           })
+      .def("window_size", &TUS::window_size);
+  py::class_<TUSMix>(mdl, "TrajectoryUSGGIWMixture")
+      .def(py::init<>())
+      .def("add_component", [](TUSMix& mixture, const TUS& component, double weight) {
+             mixture.add_component(TUS(component), weight);
+           }, py::arg("component"), py::arg("weight"))
+      .def("size", &TUSMix::size).def("__len__", &TUSMix::size)
+      .def("weight", &TUSMix::weight, py::arg("i"))
+      .def("component", [](TUSMix& mixture, std::size_t i) -> TUS& {
+             return mixture.component(i);
+           }, py::arg("i"), py::return_value_policy::reference_internal);
+
+  auto package = m.def_submodule("trajectory_usggiw");
+  py::class_<TPHD>(package, "PHD")
+      .def(py::init<>())
+      .def("set_filter", [](TPHD& phd, const EKF& filter) {
+             phd.set_filter(filter.clone());
+           }, py::arg("filter"))
+      .def("set_birth_model", [](TPHD& phd, const TUSMix& birth) {
+             phd.set_birth_model(birth.clone());
+           }, py::arg("birth"))
+      .def("set_intensity", [](TPHD& phd, const TUSMix& intensity) {
+             phd.set_intensity(intensity.clone());
+           }, py::arg("intensity"))
+      .def("set_measurement_components", [](TPHD& phd, const USMix& reports) {
+             phd.set_measurement_components(reports);
+           }, py::arg("reports"))
+      .def("set_detection_field", [](TPHD& phd, const Eigen::MatrixXd& field,
+                                      double radius, double pd_out) {
+             phd.set_detection_field(field, radius, pd_out);
+           }, py::arg("field"), py::arg("radius"), py::arg("pd_out"))
+      .def("set_grouped_detection_field", [](TPHD& phd, const Eigen::MatrixXd& field,
+                                               const std::vector<int>& groups,
+                                               double radius, double pd_out) {
+             phd.set_grouped_detection_field(field, groups, radius, pd_out);
+           }, py::arg("field"), py::arg("groups"), py::arg("radius"), py::arg("pd_out"))
+      .def("set_prob_detection", &TPHD::set_prob_detection, py::arg("pd"))
+      .def("set_prob_survive", &TPHD::set_prob_survive, py::arg("ps"))
+      .def("set_clutter_rate", &TPHD::set_clutter_rate, py::arg("rate"))
+      .def("set_clutter_density", &TPHD::set_clutter_density, py::arg("density"))
+      .def("set_extract_threshold", &TPHD::set_extract_threshold, py::arg("threshold"))
+      .def("set_prune_threshold", &TPHD::set_prune_threshold, py::arg("threshold"))
+      .def("set_merge_threshold", &TPHD::set_merge_threshold, py::arg("threshold"))
+      .def("set_max_components", &TPHD::set_max_components, py::arg("count"))
+      .def("set_gate_threshold", &TPHD::set_gate_threshold, py::arg("threshold"))
+      .def("predict", &TPHD::predict, py::arg("frame"), py::arg("dt"))
+      .def("correct", &TPHD::correct, py::arg("measurements"))
+      .def("cleanup", &TPHD::cleanup)
+      .def("expected_cardinality", [](const TPHD& phd) {
+             return phd.intensity().weights().sum();
+           })
+      .def("latest", [](TPHD& phd) { return brewpy_latest<TPHD, TUSMix>(phd); });
+}
+
+// Per-package fusion (ggiw / iggiw). Submodules are bound to lvalues first because
+// def_submodule returns a prvalue and brewpy_bind_fusion takes module_& by reference.
+static void brewpy_static_extra(py::module_& m) {
+  auto ggiw_mod = m.def_submodule("ggiw");
+  auto usggiw_mod = m.def_submodule("usggiw");
+  auto iggiw_mod = m.def_submodule("iggiw");
+  brewpy_bind_fusion<models::GGIW<>, models::USGGIW<>, models::IGGIW<>>(
+      ggiw_mod, usggiw_mod, iggiw_mod);
+  brewpy_bind_trajectory_ggiw(m);
+  brewpy_bind_trajectory_usggiw(m);
+
+  auto tm = m.def_submodule("template_matching");
+  py::class_<template_matching::PointCloud, std::shared_ptr<template_matching::PointCloud>>(tm, "PointCloud")
+      .def(py::init<Eigen::MatrixXd>(), py::arg("points"))
+      .def_property_readonly("points", [](const template_matching::PointCloud& c) {
+        return Eigen::MatrixXd(c.points());
+      })
+      .def("num_points", &template_matching::PointCloud::num_points)
+      .def("dim", &template_matching::PointCloud::dim);
+
+  auto ms = m.def_submodule("measurement_sampling");
+  ms.def("sample_pc", [](const Eigen::MatrixXd& points, int count) {
+      template_matching::PointCloud cloud(points);
+      return Eigen::MatrixXd(measurement_sampling::sample_pc(cloud, count).points());
+  }, py::arg("points"), py::arg("count"));
+
+  py::class_<template_matching::TemplateLibrary, std::shared_ptr<template_matching::TemplateLibrary>>(tm, "TemplateLibrary")
+      .def(py::init<>())
+      .def("add", [](template_matching::TemplateLibrary& lib, const Eigen::MatrixXd& pts) {
+        return lib.add(template_matching::PointCloud(pts));
+      }, py::arg("points"))
+      .def("add", [](template_matching::TemplateLibrary& lib,
+                     const Eigen::MatrixXd& pts, const Eigen::MatrixXd& normals) {
+        return lib.add(template_matching::PointCloud(pts, normals));
+      }, py::arg("points"), py::arg("normals"))
+      .def("size", &template_matching::TemplateLibrary::size);
+
+  py::class_<template_matching::IcpBase, std::shared_ptr<template_matching::IcpBase>>(tm, "IcpBase");
+  py::class_<template_matching::PointToPointIcp, template_matching::IcpBase,
+             std::shared_ptr<template_matching::PointToPointIcp>> p2p(tm, "PointToPointIcp");
+  p2p.def(py::init<>())
+     .def("set_params", [](template_matching::PointToPointIcp& obj, int max_iterations, double tolerance,
+                           double max_correspondence_dist, double sigma_sq, double trim_fraction) {
+      template_matching::IcpParams p;
+      p.max_iterations = max_iterations;
+      p.tolerance = tolerance;
+      p.max_correspondence_dist = max_correspondence_dist;
+      p.sigma_sq = sigma_sq;
+      p.trim_fraction = trim_fraction;
+      obj.set_params(p);
+    }, py::arg("max_iterations") = 50, py::arg("tolerance") = 1e-6,
+       py::arg("max_correspondence_dist") = 1e10, py::arg("sigma_sq") = 1.0,
+       py::arg("trim_fraction") = 1.0);
+
+  py::class_<template_matching::PointToPlaneIcp, template_matching::IcpBase,
+             std::shared_ptr<template_matching::PointToPlaneIcp>> p2l(tm, "PointToPlaneIcp");
+  p2l.def(py::init<>())
+     .def("set_params", [](template_matching::PointToPlaneIcp& obj, int max_iterations, double tolerance,
+                           double max_correspondence_dist, double sigma_sq, double trim_fraction,
+                           double observability_threshold) {
+      template_matching::IcpParams p;
+      p.max_iterations = max_iterations;
+      p.tolerance = tolerance;
+      p.max_correspondence_dist = max_correspondence_dist;
+      p.sigma_sq = sigma_sq;
+      p.trim_fraction = trim_fraction;
+      p.observability_threshold = observability_threshold;
+      obj.set_params(p);
+    }, py::arg("max_iterations") = 50, py::arg("tolerance") = 1e-6,
+       py::arg("max_correspondence_dist") = 1e10, py::arg("sigma_sq") = 1.0,
+       py::arg("trim_fraction") = 1.0, py::arg("observability_threshold") = 0.0);
+
+  py::class_<template_matching::PcaIcp, template_matching::IcpBase,
+             std::shared_ptr<template_matching::PcaIcp>>(tm, "PcaIcp")
+      .def(py::init([](std::shared_ptr<template_matching::IcpBase> inner,
+                       const Eigen::MatrixXd& source_template) {
+        return std::make_shared<template_matching::PcaIcp>(
+            inner->clone(), template_matching::PointCloud(source_template));
+      }), py::arg("inner_icp"), py::arg("source_template"));
+}
