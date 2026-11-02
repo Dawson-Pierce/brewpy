@@ -9,7 +9,7 @@ project(brewpy LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# brew's static subsystem libs are linked into the shared _brewpy module, so they must be PIC.
+# BREW's static library are linked into the shared _brewpy module, so it must be PIC.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(BREW_TARGET "desktop" CACHE STRING "brew build target (desktop needed for sampling/clustering)")
 # Python verification uses BREW's estimators and samplers, while figures are
@@ -19,7 +19,7 @@ set(BREW_ENABLE_PLOTTING OFF CACHE BOOL "" FORCE)
 set(BREW_BUILD_TESTS OFF CACHE BOOL "Build BREW tests with the Python bindings")
 set(BREW_BUILD_EXAMPLES OFF CACHE BOOL "Build BREW examples with the Python bindings")
 
-# the brew library (INTERFACE target `brew` + its subsystem libs)
+# the BREW static library
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/brew/CMakeLists.txt")
   message(FATAL_ERROR "BREW source is missing. Initialize the brew submodule before building: git submodule update --init --recursive")
 endif()
@@ -42,7 +42,7 @@ add_custom_command(
   COMMENT "Generating brewpy bindings from @mex annotations"
   VERBATIM)
 
-pybind11_add_module(_brewpy ${GENERATED})
+pybind11_add_module(_brewpy ${GENERATED} src/spherical_tracking.cpp)
 target_include_directories(_brewpy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/brew/include)
 target_link_libraries(_brewpy PRIVATE brew)
 

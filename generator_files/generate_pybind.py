@@ -1,6 +1,6 @@
 """Generate the brewpy pybind11 module from annotated C++ headers.
 
-    python generate_pybind.py --brew ../brew --out ../brew/bindings/bindings_generated.cpp
+    python generator_files/generate_pybind.py --brew brew --out build/bindings_generated.cpp
 """
 
 import re
@@ -9,18 +9,16 @@ from pathlib import Path
 from dataclasses import dataclass, field as dfield
 from typing import List, Tuple
 
-# Bind the BREW models used by the dissertation figures. Orientation/intensity-weighted variants
-# and trajectory variants still need package-specific binding work because their generic
-# accessors are overloaded or windowed.
+# The generic emitter handles single-state accessors. Trajectory GGIW and USGGIW
+# are bound in pybind_static.cpp.in; the remaining skipped families are not exposed.
 SKIP_MODELS = {"TrajectoryTemplatePose",
                "GGIWOrientation", "IGGIW",
                "TrajectoryGaussian", "TrajectoryGGIW", "TrajectoryGGIWOrientation",
                "TrajectoryIGGIW", "TrajectoryUSGGIW"}
 SKIP_FILTERS = {"TrajectoryTmEkf"}
-SKIP_RFS_MODELS = set()
 
 # ---------------------------------------------------------------------------
-# Annotation model + parser  (kept identical to generate_mex.py)
+# Annotation model + parser (reads BREW's shared @mex metadata)
 # ---------------------------------------------------------------------------
 @dataclass
 class Field:
@@ -56,6 +54,7 @@ class FilterDef:
     dist: str
     setters: List[Tuple[str, str]]
     handle_setters: List[Tuple[str, str]] = dfield(default_factory=list)
+    config_fields: List[str] = dfield(default_factory=list)
 
 @dataclass
 class RFSDef:
@@ -68,6 +67,7 @@ class RFSDef:
     has_birth_weights: bool = False
     has_cluster_object: bool = False
     optional_params: List[Tuple[str, str]] = dfield(default_factory=list)
+    config_fields: List[str] = dfield(default_factory=list)
 
 @dataclass
 class ClusteringDef:
@@ -89,8 +89,8 @@ def to_snake(name: str) -> str:
     s = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", s)
     return s.lower()
 
-def pkg_of(m) -> str:
-    return m.header.split("/")[1]
+def model_key(m) -> str:
+    return to_snake(m.name)
 
 def pluralize(name: str) -> str:
     if name.endswith("sis"):
@@ -186,7 +186,8 @@ def scan_headers(root: Path):
                         continue
                     filters.append(FilterDef(tags["name"], header, tags.get("dist", ""),
                                              parse_args_str(tags.get("setters", "")),
-                                             handle_setters=parse_args_str(tags.get("handle_setters", ""))))
+                                             handle_setters=parse_args_str(tags.get("handle_setters", "")),
+                                             config_fields=[s.strip() for s in tags.get("config", "").split(",") if s.strip()]))
                 elif cat == "rfs":
                     has = [s.strip() for s in tags.get("has", "").split(",")]
                     rfs_types.append(RFSDef(
@@ -196,13 +197,14 @@ def scan_headers(root: Path):
                         has_track_histories="track_histories" in has,
                         has_birth_weights="birth_weights" in has,
                         has_cluster_object="cluster_object" in has,
-                        optional_params=parse_args_str(tags.get("optional_params", ""))))
+                        optional_params=parse_args_str(tags.get("optional_params", "")),
+                        config_fields=[s.strip() for s in tags.get("config", "").split(",") if s.strip()]))
                 elif cat == "clustering":
                     clustering.append(ClusteringDef(tags["name"], header,
                                                     parse_args_str(tags.get("args", ""))))
                 elif cat == "icp":
                     icp_types.append(IcpDef(tags["name"], header,
-                                            tags.get("namespace", "template_matching"),
+                                            tags.get("namespace", "utils::registration"),
                                             parse_args_str(tags.get("args", "")),
                                             parse_params_str(tags.get("params", ""))))
     return dynamics, models_list, filters, rfs_types, clustering, icp_types
@@ -215,14 +217,10 @@ CPP_ARG = {"int": "int", "scalar": "double", "double": "double",
            "vec": "Eigen::VectorXd", "mat": "Eigen::MatrixXd",
            "ivec": "std::vector<int>", "fvec": "std::vector<double>"}
 
-def _ctor_type(t):
-    # clustering 'vec'/'ivec' map to std::vector (raw lists), everything else per CPP_ARG
-    return CPP_ARG.get(t, "double")
-
 def emit_includes(defs_headers):
-    L = ["// Auto-generated from @mex annotations by brewpy/generate_pybind.py. DO NOT EDIT.",
+    L = ["// Auto-generated from @mex annotations by generator_files/generate_pybind.py. DO NOT EDIT.",
          "#include <pybind11/pybind11.h>", "#include <pybind11/stl.h>",
-         "#include <pybind11/eigen.h>", "#include <Eigen/Dense>",
+         "#include <pybind11/eigen.h>", "#include <pybind11/functional.h>", "#include <Eigen/Dense>",
          "#include <memory>", "#include <stdexcept>", "#include <string>",
          "#include <utility>", "#include <vector>", ""]
     for h in sorted(defs_headers):
@@ -230,13 +228,35 @@ def emit_includes(defs_headers):
     L += ["", "namespace py = pybind11;", "using namespace brew;", ""]
     return "\n".join(L)
 
+def emit_config_parsers(definitions):
+    """Map named arguments to native Config fields; C++ owns types and defaults."""
+    L = []
+    for definition in definitions:
+        if not definition.config_fields:
+            continue
+        L.extend([
+            'template<class Owner>',
+            f'static typename Owner::Config brewpy_{definition.name}_config(const py::kwargs& kwargs) {{',
+            '  typename Owner::Config config;',
+            '  for (auto item : kwargs) {',
+            '    const auto name = py::cast<std::string>(item.first);',
+        ])
+        for i, name in enumerate(definition.config_fields):
+            L.append(f'    {"else " if i else ""}if (name == "{name}") '
+                     f'config.{name} = py::cast<decltype(config.{name})>(item.second);')
+        L.extend([f'    else throw py::type_error("Unknown {definition.name} configuration field: " + name);',
+                  '  }', '  return config;', '}'])
+    return "\n".join(L)
+
 def emit_dynamics(dynamics):
     L = ['  auto dyn = m.def_submodule("dynamics");',
-         '  py::class_<dynamics::DynamicsBase<>, std::shared_ptr<dynamics::DynamicsBase<>>>(dyn, "DynamicsBase");']
+         '  py::class_<dynamics::DynamicsBase<>, std::shared_ptr<dynamics::DynamicsBase<>>>(dyn, "DynamicsBase")',
+         '      .def("set_impulse_model", &dynamics::DynamicsBase<>::set_impulse_model, py::arg("model"))',
+         '      .def_property_readonly("impulse_model", &dynamics::DynamicsBase<>::impulse_model, py::return_value_policy::reference_internal);']
     for d in dynamics:
         impl = f"dynamics::{d.name}<>"
         bound = f"BrewpyDynamicsAdapter<{impl}>" if d.fixed_state_dim else impl
-        types = ", ".join(_ctor_type(t) for _, t in d.args)
+        types = ", ".join(CPP_ARG[t] for _, t in d.args)
         args = "".join(f', py::arg("{n}")' for n, _ in d.args)
         init = f".def(py::init<{types}>(){args})" if d.args else ".def(py::init<>())"
         L.append(f'  py::class_<{bound}, dynamics::DynamicsBase<>, '
@@ -264,27 +284,32 @@ def emit_dynamics(dynamics):
     return "\n".join(L)
 
 def emit_clustering(clustering):
-    L = ['  auto clt = m.def_submodule("clustering");',
-         '  py::class_<clustering::ClusterBase, std::shared_ptr<clustering::ClusterBase>>(clt, "ClusterBase");']
+    L = ['  auto clt = m.def_submodule("utils").def_submodule("clustering");',
+         '  py::class_<utils::clustering::ClusterBase, std::shared_ptr<utils::clustering::ClusterBase>>(clt, "ClusterBase");']
     for c in clustering:
         if c.name == "MahalanobisDBSCAN":
             continue  # derives from DBSCAN, not ClusterBase -> invalid class_<.,ClusterBase,.>
         tmap = {"vec": "std::vector<double>", "ivec": "std::vector<int>",
                 "int": "int", "scalar": "double", "double": "double"}
-        types = ", ".join(tmap.get(t, "double") for _, t in c.args)
+        types = ", ".join(tmap[t] for _, t in c.args)
         args = "".join(f', py::arg("{n}")' for n, _ in c.args)
-        L.append(f'  py::class_<clustering::{c.name}, clustering::ClusterBase, '
-                 f'std::shared_ptr<clustering::{c.name}>>(clt, "{c.name}")')
+        L.append(f'  py::class_<utils::clustering::{c.name}, utils::clustering::ClusterBase, '
+                 f'std::shared_ptr<utils::clustering::{c.name}>>(clt, "{c.name}")')
         L.append(f'      .def(py::init<{types}>(){args})')
-        L.append(f'      .def("cluster", &clustering::{c.name}::cluster, py::arg("Z"));')
+        L.append(f'      .def("cluster", &utils::clustering::{c.name}::cluster, py::arg("Z"));')
     return "\n".join(L)
 
 def emit_filters(filters):
     L = ['  auto flt = m.def_submodule("filters");']
+    for dist in sorted({f.dist for f in filters}):
+        L.append(f'  py::class_<filters::Filter<models::{dist}<>>>(flt, "{dist}Filter");')
     for f in filters:
         T = f"filters::{f.name}<>"
-        L.append(f'  py::class_<{T}>(flt, "{f.name}")')
+        L.append(f'  py::class_<{T}, filters::Filter<models::{f.dist}<>>>(flt, "{f.name}")')
         L.append("      .def(py::init<>())")
+        if f.config_fields:
+            L.append(f'      .def(py::init([](py::kwargs kwargs) {{ return std::make_unique<{T}>('
+                     f'brewpy_{f.name}_config<{T}>(kwargs)); }}))')
         L.append(f'      .def("set_dynamics", &{T}::set_dynamics, py::arg("dyn"))')
         for meth, arg in (("set_process_noise", "Q"), ("set_measurement_jacobian", "H"),
                           ("set_measurement_noise", "R")):
@@ -329,13 +354,12 @@ def emit_models(models_list):
             continue                                    # trajectory models: handled in static prelude
         T = mo.cpp_type
         if mo.name == "TemplatePose":
-            types = "Eigen::VectorXd, Eigen::MatrixXd, int, std::vector<int>, Eigen::MatrixXd, int"
             args = ', py::arg("mean"), py::arg("covariance"), py::arg("template_id"), py::arg("pos_indices"), py::arg("rotation") = Eigen::Matrix3d::Identity(), py::arg("mode_id") = 0'
             init = (f'.def(py::init([](Eigen::VectorXd mean, Eigen::MatrixXd covariance, int template_id, '
                     f'std::vector<int> pos_indices, Eigen::MatrixXd rotation, int mode_id) {{ return {T}(std::move(mean), '
                     f'std::move(covariance), template_id, std::move(pos_indices), rotation, mode_id); }}){args})')
         else:
-            types = ", ".join(CPP_ARG.get(f.type, "double") for f in mo.fields)
+            types = ", ".join(CPP_ARG[f.type] for f in mo.fields)
             args = "".join(f', py::arg("{f.name}")' for f in mo.fields)
             init = f'.def(py::init<{types}>(){args})'
         L.append(f'  py::class_<{T}>(mdl, "{mo.name}")')
@@ -350,9 +374,16 @@ def emit_models(models_list):
         if mo.name == "TemplatePose":
             L.append(f'      .def_property_readonly("mode_id", [](const {T}& c) {{ return c.mode_id(); }})')
             L.append(f'      .def("mark_pca_aligned", &{T}::mark_pca_aligned)')
+            L.append(f'      .def("set_impulse_evidence", &{T}::set_impulse_evidence)')
+            L.append(f'      .def("set_impulse_branch_evidence", &{T}::set_impulse_branch_evidence)')
             for name in ("impulse_observation", "impulse_variance", "impulse_branch",
                          "impulse_log_zero", "impulse_log_positive"):
                 L.append(f'      .def_property_readonly("{name}", &{T}::{name})')
+            L.append(f'      .def_property("firing", &{T}::firing, &{T}::set_firing)')
+        state = "models::CategoricalIntent"
+        L.append(f'      .def_property("intent", [](const {T}& d) {{ return d.template augmentation<{state}>(); }}, '
+                 f'[]({T}& d, {state} state) {{ d.set_augmentation(std::move(state)); }})')
+        L.append(f'      .def("clear_augmentation", &{T}::clear_augmentation)')
         L[-1] += ";"
         # Mixture<Model>
         MT = f"models::Mixture<{T}>"
@@ -360,6 +391,8 @@ def emit_models(models_list):
         L.append("      .def(py::init<>())")
         L.append(f'      .def("add_component", []({MT}& mx, const {T}& c, double w) '
                  f'{{ mx.add_component({T}(c), w); }}, py::arg("component"), py::arg("weight"))')
+        L.append(f'      .def("merge", []({MT}& mx, double threshold, double rotation) {{ mx.merge(threshold, rotation); }}, '
+                 f'py::arg("threshold"), py::arg("rotation_threshold") = 1.5707963267948966)')
         L.append(f'      .def("size", &{MT}::size).def("__len__", &{MT}::size)')
         L.append(f'      .def("weight", &{MT}::weight, py::arg("i"))')
         L.append(f'      .def("component", []({MT}& mx, std::size_t i) -> {T}& '
@@ -367,33 +400,35 @@ def emit_models(models_list):
     return "\n".join(L)
 
 def emit_rfs(models_list, rfs_types, filters):
-    """Bind each concrete (model-package)::RFS<> tracker, one submodule per package."""
+    """Bind the density specializations of the shared RFS algorithms."""
     L = []
     dist2filters = {}
     for f in filters:
         if f.dist:
             dist2filters.setdefault(f.dist, []).append(f.name)
-    rfs_models = [m for m in models_list if m.name not in SKIP_RFS_MODELS and not m.is_trajectory]
-    pkgs = {}
+    rfs_models = [m for m in models_list if not m.is_trajectory]
     for mo in rfs_models:
-        pkgs.setdefault(pkg_of(mo), mo)               # one representative model per package
-    for pkg, mo in pkgs.items():
+        pkg = model_key(mo)
         T = mo.cpp_type
         MT = f"models::Mixture<{T}>"
         FTS = dist2filters.get(mo.name, [])
         if not FTS:
             continue                                  # no matching filter -> tracker bound elsewhere
         sub = f"{pkg}_mod"
-        L.append(f'  auto {sub} = m.def_submodule("{pkg}");')
-        for r in (item for item in rfs_types if pkg_of(item) == pkg):
-            if r.name in ("MBM", "PMBM"):
+        L.append(f'  auto {sub} = m.def_submodule("multiObjectTrackers");')
+        for r in rfs_types:
+            if r.name in ("MBM", "PMBM") or (pkg == "usggiw" and r.name not in ("PHD", "GLMB")):
                 continue  # different (Bernoulli) birth API; not needed for the constellation sim
-            RT = f"{pkg}::{r.name}<>"
-            L.append(f'  py::class_<{RT}>({sub}, "{r.name}")')
+            RT = f"multiObjectTrackers::{r.name}<{T}>"
+            L.append(f'  py::class_<{RT}>({sub}, "{mo.name}{r.name}")')
             L.append("      .def(py::init<>())")
-            for FT in FTS:
-                L.append(f'      .def("set_filter", []({RT}& p, const filters::{FT}<>& f) '
-                         f'{{ p.set_filter(f.clone()); }}, py::arg("filter"))')
+            FT = f"filters::Filter<{T}>"
+            kwargs = ', py::kwargs kwargs' if r.config_fields else ''
+            config = f', brewpy_{r.name}_config<{RT}>(kwargs)' if r.config_fields else ''
+            L.append(f'      .def(py::init([](const {FT}& f{kwargs}) '
+                     f'{{ return std::make_unique<{RT}>(f{config}); }}), py::arg("filter"))')
+            L.append(f'      .def("set_filter", []({RT}& p, const {FT}& f) '
+                     f'{{ p.set_filter(f.clone()); }}, py::arg("filter"))')
             if "GLMB" in r.name:
                 L.append(f'      .def("set_birth_model", []({RT}& p, const {MT}& b, double pb) '
                          f'{{ p.set_birth_model(b.clone(), pb); }}, py::arg("birth"), py::arg("p_birth"))')
@@ -410,11 +445,10 @@ def emit_rfs(models_list, rfs_types, filters):
                 L.append(f'      .def("set_birth_model", []({RT}& p, const {MT}& b) '
                          f'{{ p.set_birth_model(b.clone()); }}, py::arg("birth"))')
             if r.name in ("PHD", "CPHD"):
-                # the (P)PHD intensity is null until set; predict() no-ops without it
+                # Allow callers to replace the constructor's initial intensity.
                 L.append(f'      .def("set_intensity", []({RT}& p, const {MT}& i) '
                          f'{{ p.set_intensity(i.clone()); }}, py::arg("intensity"))')
-            if (pkg in ("ggiw", "usggiw") and r.name == "PHD") or \
-                    (pkg in ("ggiw", "usggiw") and r.name == "GLMB") or \
+            if (pkg in ("ggiw", "usggiw") and r.name in ("PHD", "GLMB")) or \
                     (pkg == "gaussian" and r.name == "GLMB"):
                 # state-dependent detection probability (observation-window / field-of-view aware):
                 # ggiw PHD onboard (per-satellite FOV) and the ground GLMB (observability field from the
@@ -430,8 +464,6 @@ def emit_rfs(models_list, rfs_types, filters):
             if pkg == "usggiw" and r.name == "PHD":
                 L.append(f'      .def("set_measurement_components", []({RT}& p, const {MT}& z) '
                          f'{{ p.set_measurement_components(z); }}, py::arg("z"))')
-            for meth in r.init_methods:
-                pass  # @mex_init is MEX-store specific
             for setter, default in (("set_prob_detection", "pd"), ("set_prob_survive", "ps"),
                                     ("set_clutter_rate", "rate"), ("set_clutter_density", "density")):
                 L.append(f'      .def("{setter}", &{RT}::{setter}, py::arg("{default}"))')
@@ -449,6 +481,7 @@ def emit_rfs(models_list, rfs_types, filters):
             if r.has_track_histories:
                 L.append(f'      .def("track_histories", &{RT}::track_histories)')
             L.append(f'      .def("latest", []({RT}& p) {{ return brewpy_latest<{RT}, {MT}>(p); }});')
+            L.append(f'  {sub}.def("{r.name}", [](const {FT}& filter{kwargs}) {{ return std::make_unique<{RT}>(filter{config}); }}, py::arg("filter"));')
     return "\n".join(L)
 
 
@@ -460,17 +493,21 @@ def generate(brew_root: Path) -> str:
         for d in grp:
             headers.add(d.header)
     for mo in models_list:
-        headers.add(f"brew/{pkg_of(mo)}/{pkg_of(mo)}.hpp")
-    headers.update(["brew/shared/mixture.hpp", "brew/dynamics/dynamics_base.hpp",
-                    "brew/clustering/cluster_base.hpp", "brew/shared/filter_base.hpp"])
+        headers.add(f"brew/models/merge/{model_key(mo)}.hpp")
+    headers.update(["brew/models/mixture.hpp", "brew/dynamics/dynamics_base.hpp",
+                    "brew/utils/clustering/cluster_base.hpp", "brew/filters/filter_base.hpp"])
 
     static = (Path(__file__).parent / "pybind_static.cpp.in").read_text(encoding="utf-8")
-    body = [emit_includes(headers), static,
+    intent_bindings = [f'  brewpy_bind_categorical_intent<{mo.cpp_type}>(m, "{mo.name}");'
+                       for mo in models_list if not mo.is_trajectory and mo.name != "TemplatePose"
+                       and any(f.dist == mo.name for f in filters)]
+    body = [emit_includes(headers), emit_config_parsers([*filters, *rfs_types]), static,
             "PYBIND11_MODULE(_brewpy, m) {",
             '  m.doc() = "BREW RFS tracking (pybind11), auto-generated from @mex annotations.";',
+            "  brewpy_augmentation_bindings(m);",
             emit_models(models_list), emit_dynamics(dynamics), emit_clustering(clustering),
             emit_filters(filters), emit_rfs(models_list, rfs_types, filters),
-            "  brewpy_static_extra(m);", "}", ""]
+            *intent_bindings, "  brewpy_static_extra(m);", "}", ""]
     counts = (f"// generated: {len(dynamics)} dynamics, {len(models_list)} models, "
               f"{len(filters)} filters, {len(rfs_types)} rfs, {len(clustering)} clustering, "
               f"{len(icp_types)} icp")
@@ -484,7 +521,8 @@ def _main():
     a = ap.parse_args()
     brew_root = Path(a.brew).resolve()
     code = generate(brew_root)
-    out = Path(a.out) if a.out else (brew_root / "bindings" / "bindings_generated.cpp")
+    out = Path(a.out) if a.out else (Path(__file__).resolve().parent.parent / "build" / "bindings_generated.cpp")
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(code, encoding="utf-8")
     print(f"[gen] wrote {out}")
     print(code.splitlines()[0])

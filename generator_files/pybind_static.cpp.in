@@ -1,22 +1,213 @@
+#include "brew/filters/intent_estimator.hpp"
 // Static prelude for the auto-generated brewpy module: the `latest` helper used by every RFS
 // tracker, plus brewpy_static_extra() which hand-binds fusion and template-matching helpers.
-#include "brew/ggiw/gci.hpp"
-#include "brew/usggiw/gci.hpp"
-#include "brew/iggiw/gci.hpp"
-#include "brew/trajectory_ggiw/trajectory_ggiw_model.hpp"
-#include "brew/trajectory_ggiw/filters/trajectory_ggiw_ekf.hpp"
-#include "brew/trajectory_ggiw/multi_target/phd.hpp"
-#include "brew/trajectory_usggiw/trajectory_usggiw_model.hpp"
-#include "brew/trajectory_usggiw/filters/trajectory_usggiw_ekf.hpp"
-#include "brew/trajectory_usggiw/multi_target/phd.hpp"
-#include "brew/template_matching/icp_base.hpp"
-#include "brew/template_matching/pca_icp.hpp"
-#include "brew/template_matching/point_cloud.hpp"
-#include "brew/template_matching/point_to_plane_icp.hpp"
-#include "brew/template_matching/point_to_point_icp.hpp"
-#include "brew/template_matching/template_library.hpp"
-#include "brew/desktop/measurement_sampling/measurement_sampling.hpp"
-#include "brew/shared/fusion/arithmetic_average.hpp"
+#include "brew/utils/fusion/ggiw_gci.hpp"
+#include "brew/utils/fusion/usggiw_gci.hpp"
+#include "brew/utils/fusion/iggiw_gci.hpp"
+#include "brew/models/trajectory_ggiw.hpp"
+#include "brew/models/merge/trajectory_ggiw.hpp"
+#include "brew/filters/trajectory_ggiw_ekf.hpp"
+#include "brew/multiObjectTrackers/phd.hpp"
+#include "brew/models/trajectory_usggiw.hpp"
+#include "brew/models/merge/trajectory_usggiw.hpp"
+#include "brew/filters/trajectory_usggiw_ekf.hpp"
+#include "brew/multiObjectTrackers/phd.hpp"
+#include "brew/utils/registration/icp_base.hpp"
+#include "brew/utils/registration/pca_icp.hpp"
+#include "brew/utils/registration/point_cloud.hpp"
+#include "brew/utils/registration/point_to_plane_icp.hpp"
+#include "brew/utils/registration/point_to_point_icp.hpp"
+#include "brew/utils/registration/template_library.hpp"
+#include "brew/utils/measurement_sampling/measurement_sampling.hpp"
+#include "brew/utils/fusion/arithmetic_average.hpp"
+
+#include "brew/models/pointing_firing_model.hpp"
+#include "brew/filters/intent_filter.hpp"
+
+// All instantiated density families use the same augmentation and wrapper API.
+static void brewpy_augmentation_bindings(py::module_& m) {
+  auto module = m.def_submodule("models");
+  using State = models::CategoricalIntent;
+  py::class_<State>(module, "CategoricalIntent")
+      .def(py::init<>())
+      .def_readwrite("objectives", &State::objectives)
+      .def_readwrite("probabilities", &State::probabilities);
+}
+
+template<class Dist, class Estimator>
+static void brewpy_bind_intent_filter(py::module_& m, const std::string& name) {
+  using Primary = filters::Filter<Dist>;
+  using Wrapper = filters::IntentFilter<Dist, Estimator>;
+  auto module = m.def_submodule("filters");
+  py::class_<Wrapper, Primary>(module, (name + "IntentFilter").c_str())
+      .def(py::init<const Primary&, const Estimator&>(), py::arg("primary"), py::arg("intent"));
+  module.def("IntentFilter", [](const Primary& primary, const Estimator& intent) {
+    return std::make_unique<Wrapper>(primary, intent);
+  }, py::arg("primary"), py::arg("intent"));
+}
+
+template<class Dist>
+static void brewpy_bind_categorical_intent(py::module_& m, const std::string& name) {
+  auto module = m.def_submodule("models");
+  auto filter_module = m.def_submodule("filters");
+  using Behavior = models::PredictiveBehaviorModel<Dist>;
+  using Neutral = models::UninformativeBehavior<Dist>;
+  using Hypothesis = models::IntentHypothesis<Dist>;
+  using Estimator = filters::IntentEstimator<Dist>;
+  py::class_<Behavior, std::shared_ptr<Behavior>>(module, (name+"PredictiveBehaviorModel").c_str())
+      .def("log_evidence", [](const Behavior& model, const Dist& current,
+                              const Dist* previous, double dt) {
+        model.validate();
+        if (!std::isfinite(dt) || dt <= 0) throw std::invalid_argument("Behavior timestep must be positive");
+        return model.log_evidence(current, previous, dt);
+      }, py::arg("current"), py::arg("previous") = nullptr, py::arg("dt") = 30.0);
+  py::class_<Neutral, Behavior, std::shared_ptr<Neutral>>(module, (name+"UninformativeBehavior").c_str())
+      .def(py::init<>());
+  py::class_<Hypothesis>(module, (name+"IntentHypothesis").c_str())
+      .def(py::init([](std::string label, std::shared_ptr<Behavior> model) {
+        Hypothesis h{std::move(label), std::move(model)}; h.validate(); return h;
+      }), py::arg("name"), py::arg("model"))
+      .def_readonly("name", &Hypothesis::name)
+      .def_readonly("model", &Hypothesis::model);
+  module.def("IntentHypothesis", [](std::string label, std::shared_ptr<Behavior> model) {
+    Hypothesis h{std::move(label), std::move(model)}; h.validate(); return h;
+  }, py::arg("name"), py::arg("model"));
+  py::class_<Estimator>(filter_module, (name+"IntentEstimator").c_str())
+      .def(py::init<std::vector<Hypothesis>, double, double>(),
+           py::arg("hypotheses"), py::arg("dt")=30., py::arg("objective_stay")=.9)
+      .def_readonly("hypotheses", &Estimator::hypotheses)
+      .def_readonly("objective_stay", &Estimator::objective_stay)
+      .def_property_readonly("objectives", &Estimator::objectives)
+      .def("predict_probabilities", &Estimator::predict_probabilities)
+      .def("correct", &Estimator::correct, py::arg("current"), py::arg("previous")=nullptr,
+           py::arg("continuous_observation")=true)
+      .def("posterior_history", &Estimator::posterior_history, py::arg("densities"))
+      .def("evidence_recursion", &Estimator::evidence_recursion);
+  filter_module.def("IntentEstimator", [](std::vector<Hypothesis> hypotheses, double dt, double stay) {
+    return Estimator(std::move(hypotheses), dt, stay);
+  }, py::arg("hypotheses"), py::arg("dt")=30., py::arg("objective_stay")=.9);
+  brewpy_bind_intent_filter<Dist, Estimator>(m, name);
+}
+
+// Convert saved journal records at the binding boundary. Inference stays in BREW.
+static models::TemplatePose<> brewpy_pose_record(const py::handle& value,
+                                                  const std::vector<std::string>& objectives) {
+  using Pose = models::TemplatePose<>;
+  if (py::isinstance<Pose>(value)) return py::cast<Pose>(value);
+  Pose pose(py::cast<Eigen::VectorXd>(value.attr("mean")),
+            py::cast<Eigen::MatrixXd>(value.attr("covariance")),
+            py::cast<int>(value.attr("template_id")), {0, 1, 2},
+            py::cast<Eigen::Matrix3d>(value.attr("rotation")), py::cast<int>(value.attr("mode_id")));
+  pose.set_impulse_evidence(py::cast<double>(value.attr("impulse_observation")),
+                            py::cast<double>(value.attr("impulse_variance")));
+  pose.set_impulse_branch_evidence(py::cast<double>(value.attr("impulse_log_zero")),
+                                   py::cast<double>(value.attr("impulse_log_positive")));
+  if (py::hasattr(value, "intent_posterior") && !value.attr("intent_posterior").is_none()) {
+    models::CategoricalIntent mark;
+    mark.objectives = py::hasattr(value, "intent_objectives")
+        ? py::cast<std::vector<std::string>>(value.attr("intent_objectives"))
+        : objectives;
+    if (mark.objectives.empty()) mark.objectives = objectives;
+    mark.probabilities = py::cast<Eigen::VectorXd>(value.attr("intent_posterior"));
+    pose.set_augmentation(std::move(mark));
+  }
+  models::FiringEstimate firing;
+  firing.impulse_probability = py::cast<double>(value.attr("impulse_probability"));
+  firing.impulse_magnitude = py::cast<double>(value.attr("impulse_magnitude"));
+  firing.impulse_std = py::cast<double>(value.attr("impulse_std"));
+  firing.impulse_lower = py::cast<double>(value.attr("impulse_lower"));
+  firing.impulse_upper = py::cast<double>(value.attr("impulse_upper"));
+  pose.set_firing(std::move(firing));
+  return pose;
+}
+
+static void brewpy_intent_bindings(py::module_& m) {
+  using Estimator = filters::IntentEstimator<models::TemplatePose<>>;
+  using Pose = models::TemplatePose<>;
+  using State = models::FiringEstimate;
+  using Behavior = models::PredictiveBehaviorModel<models::TemplatePose<>>;
+  using PointingFiring = models::PointingFiringModel;
+  using Pointing = models::PointingRule;
+  brewpy_bind_categorical_intent<models::TemplatePose<>>(m, "TemplatePose");
+  auto module = m.def_submodule("models");
+  using Impulse = models::ImpulsePrior;
+  py::class_<Impulse>(module, "ImpulsePrior")
+      .def(py::init<double, double>(), py::arg("maximum"), py::arg("probability"))
+      .def_readonly("maximum", &Impulse::maximum)
+      .def_readonly("probability", &Impulse::probability);
+  auto motion = m.def_submodule("dynamics");
+  py::class_<dynamics::ImpulseModel>(motion, "ImpulseModel")
+      .def(py::init<const Impulse&, Eigen::VectorXd, std::vector<int>, bool>(),
+           py::arg("prior"), py::arg("axis") = Eigen::Vector3d::UnitX(),
+           py::arg("velocity_indices") = std::vector<int>{3, 4, 5}, py::arg("body_frame") = false)
+      .def_property_readonly("prior", &dynamics::ImpulseModel::prior, py::return_value_policy::reference_internal)
+      .def_property_readonly("axis", &dynamics::ImpulseModel::axis)
+      .def_property_readonly("velocity_indices", &dynamics::ImpulseModel::velocity_indices)
+      .def_property_readonly("body_frame", &dynamics::ImpulseModel::body_frame);
+  py::enum_<Pointing>(module, "PointingRule")
+      .value("Fixed", Pointing::Fixed)
+      .value("Radial", Pointing::Radial)
+      .value("Tangential", Pointing::Tangential);
+  // No trampoline: behavior inference must remain native, without Python callbacks.
+  py::class_<PointingFiring, Behavior, std::shared_ptr<PointingFiring>>(module, "PointingFiringModel")
+      .def(py::init<Pointing, const Impulse&, Eigen::Vector3d, double, std::optional<double>,
+                    double, double, double, bool, bool>(),
+          py::arg("pointing"), py::arg("impulse"),
+          py::arg("axis") = Eigen::Vector3d::UnitX(), py::arg("radial_sign") = 1.0,
+          py::arg("firing_probability") = py::none(), py::arg("attitude_sigma") = 4.5 * M_PI / 180.0,
+          py::arg("gain_max") = 0.00575, py::arg("holding_probability") = 0.2,
+          py::arg("use_direction") = true, py::arg("use_impulse") = true)
+      .def(py::init([](Pointing pointing, const Eigen::Vector3d& axis, double radial_sign,
+                      double firing_probability, double sigma, double gain, double holding,
+                      double maximum, bool direction, bool impulse) {
+        auto model = std::make_shared<PointingFiring>();
+        model->pointing = pointing; model->axis = axis; model->radial_sign = radial_sign;
+        model->firing_probability = firing_probability; model->attitude_sigma = sigma;
+        model->gain_max = gain; model->holding_probability = holding; model->impulse_max = maximum;
+        model->use_direction = direction; model->use_impulse = impulse;
+        model->validate(); return model;
+      }), py::arg("pointing"),
+          py::arg("axis") = Eigen::Vector3d::UnitX(), py::arg("radial_sign") = 1.0,
+          py::arg("firing_probability") = 0.0, py::arg("attitude_sigma") = 4.5 * M_PI / 180.0,
+          py::arg("gain_max") = 0.00575, py::arg("holding_probability") = 0.2,
+          py::arg("impulse_max") = 0.04, py::arg("use_direction") = true, py::arg("use_impulse") = true)
+      .def_readonly("pointing", &PointingFiring::pointing)
+      .def_readonly("axis", &PointingFiring::axis)
+      .def_readonly("radial_sign", &PointingFiring::radial_sign)
+      .def_readonly("firing_probability", &PointingFiring::firing_probability)
+      .def_readonly("attitude_sigma", &PointingFiring::attitude_sigma)
+      .def_readonly("gain_max", &PointingFiring::gain_max)
+      .def_readonly("holding_probability", &PointingFiring::holding_probability)
+      .def_readonly("impulse_max", &PointingFiring::impulse_max)
+      .def_readonly("use_direction", &PointingFiring::use_direction)
+      .def_readonly("use_impulse", &PointingFiring::use_impulse)
+      .def("boresight", &PointingFiring::boresight, py::arg("position"))
+      .def("branch_log_likelihoods", &PointingFiring::branch_log_likelihoods,
+           py::arg("current"), py::arg("previous") = nullptr, py::arg("dt") = 30.0)
+      .def("impulse_log_likelihood", &PointingFiring::impulse_log_likelihood,
+           py::arg("magnitude"), py::arg("variance"), py::arg("branch_evidence") = py::none());
+  py::class_<State>(module, "FiringEstimate")
+      .def(py::init<>())
+      .def_readwrite("impulse_probability", &State::impulse_probability)
+      .def_readwrite("impulse_magnitude", &State::impulse_magnitude)
+      .def_readwrite("impulse_std", &State::impulse_std)
+      .def_readwrite("impulse_lower", &State::impulse_lower)
+      .def_readwrite("impulse_upper", &State::impulse_upper);
+  auto filters_module = m.def_submodule("filters");
+  py::reinterpret_borrow<py::class_<Estimator>>(filters_module.attr("TemplatePoseIntentEstimator"))
+      .def("posterior_history", [](const Estimator& e, const py::iterable& records) {
+        std::vector<Pose> poses;
+        for (const auto record : records) poses.push_back(brewpy_pose_record(record, e.objectives()));
+        return e.posterior_history(poses);
+      })
+      .def("correct", [](const Estimator& e, models::TemplatePose<>& current, py::object previous,
+                         bool continuous) {
+        auto old = previous.is_none() ? std::optional<Pose>{} : brewpy_pose_record(previous, e.objectives());
+        e.correct(current, old ? &*old : nullptr, continuous);
+      }, py::arg("current"), py::arg("previous") = py::none(), py::arg("continuous_observation") = true);
+
+
+}
 
 // Adapts a fixed-state DynamicsBase<T, N> implementation to the dynamic-state base
 // used by the generated Python filters. Header metadata selects this adapter, so no
@@ -92,32 +283,32 @@ static std::unique_ptr<Mix> brewpy_latest(const Filt& f) {
 }
 
 template <typename GG, typename US, typename IG>
-static void brewpy_bind_fusion(py::module_& ggiw_mod, py::module_& usggiw_mod, py::module_& iggiw_mod) {
+static void brewpy_bind_fusion(py::module_& module) {
   using GGMix = models::Mixture<GG>;
   using USMix = models::Mixture<US>;
   using IGMix = models::Mixture<IG>;
-  ggiw_mod.def("gci", [](const std::vector<GGMix*>& mx, std::vector<double> w, double pt) {
+  module.def("gci", [](const std::vector<GGMix*>& mx, std::vector<double> w, double pt) {
                  std::vector<const GGMix*> s(mx.begin(), mx.end());
-                 return std::make_unique<GGMix>(ggiw::gci(s, std::move(w), pt));
+                 return std::make_unique<GGMix>(utils::fusion::gci(s, std::move(w), pt));
                }, py::arg("sources"), py::arg("weights") = std::vector<double>{},
                py::arg("prune_threshold") = 0.0);
-  ggiw_mod.def("arithmetic_average", [](const std::vector<GGMix*>& mx, std::vector<double> w) {
+  module.def("arithmetic_average", [](const std::vector<GGMix*>& mx, std::vector<double> w) {
                  std::vector<const GGMix*> s(mx.begin(), mx.end());
-                 return std::make_unique<GGMix>(fusion::arithmetic_average<GG>(s, std::move(w)));
+                 return std::make_unique<GGMix>(utils::fusion::arithmetic_average<GG>(s, std::move(w)));
                }, py::arg("sources"), py::arg("weights") = std::vector<double>{});
-  usggiw_mod.def("gci", [](const std::vector<USMix*>& mx, std::vector<double> w, double pt) {
+  module.def("gci", [](const std::vector<USMix*>& mx, std::vector<double> w, double pt) {
                   std::vector<const USMix*> s(mx.begin(), mx.end());
-                  return std::make_unique<USMix>(usggiw::gci(s, std::move(w), pt));
+                  return std::make_unique<USMix>(utils::fusion::gci(s, std::move(w), pt));
                 }, py::arg("sources"), py::arg("weights") = std::vector<double>{},
                 py::arg("prune_threshold") = 0.0);
-  iggiw_mod.def("gci", [](const std::vector<IGMix*>& mx, std::vector<double> w, double pt) {
+  module.def("gci", [](const std::vector<IGMix*>& mx, std::vector<double> w, double pt) {
                   std::vector<const IGMix*> s(mx.begin(), mx.end());
-                  return std::make_unique<IGMix>(iggiw::gci(s, std::move(w), pt));
+                  return std::make_unique<IGMix>(utils::fusion::gci(s, std::move(w), pt));
                 }, py::arg("sources"), py::arg("weights") = std::vector<double>{},
                 py::arg("prune_threshold") = 0.0);
-  iggiw_mod.def("arithmetic_average", [](const std::vector<IGMix*>& mx, std::vector<double> w) {
+  module.def("arithmetic_average", [](const std::vector<IGMix*>& mx, std::vector<double> w) {
                   std::vector<const IGMix*> s(mx.begin(), mx.end());
-                  return std::make_unique<IGMix>(fusion::arithmetic_average<IG>(s, std::move(w)));
+                  return std::make_unique<IGMix>(utils::fusion::arithmetic_average<IG>(s, std::move(w)));
                 }, py::arg("sources"), py::arg("weights") = std::vector<double>{});
 }
 
@@ -131,13 +322,15 @@ static void brewpy_bind_trajectory_ggiw(py::module_& m) {
   using TGMix = models::Mixture<TG>;
   using GGMix = models::Mixture<GG>;
   using EKF  = filters::TrajectoryGGIWEKF<>;
-  using TPHD = trajectory_ggiw::PHD<>;
+  using TPHD = brew::multiObjectTrackers::PHD<models::TrajectoryGGIW<double, Eigen::Dynamic, Eigen::Dynamic>, Eigen::Dynamic>;
 
   auto mdl = m.def_submodule("models");
   py::class_<TG>(mdl, "TrajectoryGGIW")
       .def(py::init([](int state_dim, const GG& initial, int max_window) {
              return TG(state_dim, initial, max_window);
            }), py::arg("state_dim"), py::arg("initial"), py::arg("max_window") = 5)
+      .def_property("intent", [](const TG& d) { return d.template augmentation<models::CategoricalIntent>(); },
+                    [](TG& d, models::CategoricalIntent state) { d.set_augmentation(std::move(state)); })
       .def("current", [](const TG& t) { return t.current(); })   // latest GGIW state (pos, extent, rate)
       .def("state_history_means", [](const TG& t) { return Eigen::MatrixXd(t.state_history_means()); })
       .def("window_size", &TG::window_size);
@@ -153,10 +346,13 @@ static void brewpy_bind_trajectory_ggiw(py::module_& m) {
   // NOTE: filters::TrajectoryGGIWEKF is bound by the generated emit_filters.
   // do NOT re-bind it here or pybind errors on a duplicate type registration.
 
-  auto tg = m.def_submodule("trajectory_ggiw");
-  py::class_<TPHD>(tg, "PHD")
+  auto tg = m.def_submodule("multiObjectTrackers");
+  py::class_<TPHD>(tg, "TrajectoryGGIWPHD")
       .def(py::init<>())
-      .def("set_filter", [](TPHD& p, const EKF& f) { p.set_filter(f.clone()); }, py::arg("filter"))
+      .def(py::init([](const filters::Filter<TG>& filter, py::kwargs kwargs) {
+          return std::make_unique<TPHD>(filter, brewpy_PHD_config<TPHD>(kwargs));
+      }), py::arg("filter"))
+      .def("set_filter", [](TPHD& p, const filters::Filter<TG>& f) { p.set_filter(f.clone()); }, py::arg("filter"))
       .def("set_birth_model", [](TPHD& p, const TGMix& b) { p.set_birth_model(b.clone()); }, py::arg("birth"))
       .def("set_intensity", [](TPHD& p, const TGMix& i) { p.set_intensity(i.clone()); }, py::arg("intensity"))
       .def("set_measurement_components", [](TPHD& p, const GGMix& z) { p.set_measurement_components(z); }, py::arg("z"))
@@ -175,6 +371,8 @@ static void brewpy_bind_trajectory_ggiw(py::module_& m) {
       .def("correct", [](TPHD& p, const Eigen::MatrixXd& z) { p.correct(z); }, py::arg("measurements"))
       .def("cleanup", &TPHD::cleanup)
       .def("latest", [](TPHD& p) { return brewpy_latest<TPHD, TGMix>(p); });
+  tg.def("PHD", [](const filters::Filter<TG>& filter, py::kwargs kwargs) { return std::make_unique<TPHD>(filter, brewpy_PHD_config<TPHD>(kwargs)); }, py::arg("filter"));
+  brewpy_bind_categorical_intent<TG>(m, "TrajectoryGGIW");
 }
 
 static void brewpy_bind_trajectory_usggiw(py::module_& m) {
@@ -183,13 +381,15 @@ static void brewpy_bind_trajectory_usggiw(py::module_& m) {
   using TUSMix = models::Mixture<TUS>;
   using USMix = models::Mixture<US>;
   using EKF = filters::TrajectoryUSGGIWEKF<>;
-  using TPHD = trajectory_usggiw::PHD<>;
+  using TPHD = brew::multiObjectTrackers::PHD<models::TrajectoryUSGGIW<double, Eigen::Dynamic>, Eigen::Dynamic>;
 
   auto mdl = m.def_submodule("models");
   py::class_<TUS>(mdl, "TrajectoryUSGGIW")
       .def(py::init([](int state_dim, const US& initial, int max_window) {
              return TUS(state_dim, initial, max_window);
            }), py::arg("state_dim"), py::arg("initial"), py::arg("max_window") = 5)
+      .def_property("intent", [](const TUS& d) { return d.template augmentation<models::CategoricalIntent>(); },
+                    [](TUS& d, models::CategoricalIntent state) { d.set_augmentation(std::move(state)); })
       .def("current", [](const TUS& trajectory) { return trajectory.current(); })
       .def("state_history_directions", [](const TUS& trajectory) {
              return Eigen::MatrixXd(trajectory.state_history_directions());
@@ -215,10 +415,13 @@ static void brewpy_bind_trajectory_usggiw(py::module_& m) {
              return mixture.component(i);
            }, py::arg("i"), py::return_value_policy::reference_internal);
 
-  auto package = m.def_submodule("trajectory_usggiw");
-  py::class_<TPHD>(package, "PHD")
+  auto package = m.def_submodule("multiObjectTrackers");
+  py::class_<TPHD>(package, "TrajectoryUSGGIWPHD")
       .def(py::init<>())
-      .def("set_filter", [](TPHD& phd, const EKF& filter) {
+      .def(py::init([](const filters::Filter<TUS>& filter, py::kwargs kwargs) {
+          return std::make_unique<TPHD>(filter, brewpy_PHD_config<TPHD>(kwargs));
+      }), py::arg("filter"))
+      .def("set_filter", [](TPHD& phd, const filters::Filter<TUS>& filter) {
              phd.set_filter(filter.clone());
            }, py::arg("filter"))
       .def("set_birth_model", [](TPHD& phd, const TUSMix& birth) {
@@ -251,56 +454,57 @@ static void brewpy_bind_trajectory_usggiw(py::module_& m) {
       .def("predict", &TPHD::predict, py::arg("frame"), py::arg("dt"))
       .def("correct", &TPHD::correct, py::arg("measurements"))
       .def("cleanup", &TPHD::cleanup)
-      .def("expected_cardinality", [](const TPHD& phd) {
-             return phd.intensity().weights().sum();
-           })
+      .def("expected_cardinality", &TPHD::expected_cardinality)
       .def("latest", [](TPHD& phd) { return brewpy_latest<TPHD, TUSMix>(phd); });
+  package.def("PHD", [](const filters::Filter<TUS>& filter, py::kwargs kwargs) { return std::make_unique<TPHD>(filter, brewpy_PHD_config<TPHD>(kwargs)); }, py::arg("filter"));
+  brewpy_bind_categorical_intent<TUS>(m, "TrajectoryUSGGIW");
 }
 
-// Per-package fusion (ggiw / iggiw). Submodules are bound to lvalues first because
+// Fusion overloads share one module. Submodules are bound to lvalues because
 // def_submodule returns a prvalue and brewpy_bind_fusion takes module_& by reference.
+void brewpy_bind_spherical_tracking(py::module_& m);
+
 static void brewpy_static_extra(py::module_& m) {
-  auto ggiw_mod = m.def_submodule("ggiw");
-  auto usggiw_mod = m.def_submodule("usggiw");
-  auto iggiw_mod = m.def_submodule("iggiw");
-  brewpy_bind_fusion<models::GGIW<>, models::USGGIW<>, models::IGGIW<>>(
-      ggiw_mod, usggiw_mod, iggiw_mod);
+  brewpy_intent_bindings(m);
+  auto fusion = m.def_submodule("utils").def_submodule("fusion");
+  brewpy_bind_fusion<models::GGIW<>, models::USGGIW<>, models::IGGIW<>>(fusion);
   brewpy_bind_trajectory_ggiw(m);
   brewpy_bind_trajectory_usggiw(m);
+  brewpy_bind_spherical_tracking(m);
 
-  auto tm = m.def_submodule("template_matching");
-  py::class_<template_matching::PointCloud, std::shared_ptr<template_matching::PointCloud>>(tm, "PointCloud")
+  auto tm = m.def_submodule("utils").def_submodule("registration");
+  py::class_<utils::registration::PointCloud, std::shared_ptr<utils::registration::PointCloud>>(tm, "PointCloud")
       .def(py::init<Eigen::MatrixXd>(), py::arg("points"))
-      .def_property_readonly("points", [](const template_matching::PointCloud& c) {
+      .def_property_readonly("points", [](const utils::registration::PointCloud& c) {
         return Eigen::MatrixXd(c.points());
       })
-      .def("num_points", &template_matching::PointCloud::num_points)
-      .def("dim", &template_matching::PointCloud::dim);
+      .def("num_points", &utils::registration::PointCloud::num_points)
+      .def("dim", &utils::registration::PointCloud::dim);
 
-  auto ms = m.def_submodule("measurement_sampling");
+  auto ms = m.def_submodule("utils").def_submodule("measurement_sampling");
   ms.def("sample_pc", [](const Eigen::MatrixXd& points, int count) {
-      template_matching::PointCloud cloud(points);
-      return Eigen::MatrixXd(measurement_sampling::sample_pc(cloud, count).points());
+      utils::registration::PointCloud cloud(points);
+      return Eigen::MatrixXd(utils::measurement_sampling::sample_pc(cloud, count).points());
   }, py::arg("points"), py::arg("count"));
 
-  py::class_<template_matching::TemplateLibrary, std::shared_ptr<template_matching::TemplateLibrary>>(tm, "TemplateLibrary")
+  py::class_<utils::registration::TemplateLibrary, std::shared_ptr<utils::registration::TemplateLibrary>>(tm, "TemplateLibrary")
       .def(py::init<>())
-      .def("add", [](template_matching::TemplateLibrary& lib, const Eigen::MatrixXd& pts) {
-        return lib.add(template_matching::PointCloud(pts));
+      .def("add", [](utils::registration::TemplateLibrary& lib, const Eigen::MatrixXd& pts) {
+        return lib.add(utils::registration::PointCloud(pts));
       }, py::arg("points"))
-      .def("add", [](template_matching::TemplateLibrary& lib,
+      .def("add", [](utils::registration::TemplateLibrary& lib,
                      const Eigen::MatrixXd& pts, const Eigen::MatrixXd& normals) {
-        return lib.add(template_matching::PointCloud(pts, normals));
+        return lib.add(utils::registration::PointCloud(pts, normals));
       }, py::arg("points"), py::arg("normals"))
-      .def("size", &template_matching::TemplateLibrary::size);
+      .def("size", &utils::registration::TemplateLibrary::size);
 
-  py::class_<template_matching::IcpBase, std::shared_ptr<template_matching::IcpBase>>(tm, "IcpBase");
-  py::class_<template_matching::PointToPointIcp, template_matching::IcpBase,
-             std::shared_ptr<template_matching::PointToPointIcp>> p2p(tm, "PointToPointIcp");
+  py::class_<utils::registration::IcpBase, std::shared_ptr<utils::registration::IcpBase>>(tm, "IcpBase");
+  py::class_<utils::registration::PointToPointIcp, utils::registration::IcpBase,
+             std::shared_ptr<utils::registration::PointToPointIcp>> p2p(tm, "PointToPointIcp");
   p2p.def(py::init<>())
-     .def("set_params", [](template_matching::PointToPointIcp& obj, int max_iterations, double tolerance,
+     .def("set_params", [](utils::registration::PointToPointIcp& obj, int max_iterations, double tolerance,
                            double max_correspondence_dist, double sigma_sq, double trim_fraction) {
-      template_matching::IcpParams p;
+      utils::registration::IcpParams p;
       p.max_iterations = max_iterations;
       p.tolerance = tolerance;
       p.max_correspondence_dist = max_correspondence_dist;
@@ -311,13 +515,13 @@ static void brewpy_static_extra(py::module_& m) {
        py::arg("max_correspondence_dist") = 1e10, py::arg("sigma_sq") = 1.0,
        py::arg("trim_fraction") = 1.0);
 
-  py::class_<template_matching::PointToPlaneIcp, template_matching::IcpBase,
-             std::shared_ptr<template_matching::PointToPlaneIcp>> p2l(tm, "PointToPlaneIcp");
+  py::class_<utils::registration::PointToPlaneIcp, utils::registration::IcpBase,
+             std::shared_ptr<utils::registration::PointToPlaneIcp>> p2l(tm, "PointToPlaneIcp");
   p2l.def(py::init<>())
-     .def("set_params", [](template_matching::PointToPlaneIcp& obj, int max_iterations, double tolerance,
+     .def("set_params", [](utils::registration::PointToPlaneIcp& obj, int max_iterations, double tolerance,
                            double max_correspondence_dist, double sigma_sq, double trim_fraction,
                            double observability_threshold) {
-      template_matching::IcpParams p;
+      utils::registration::IcpParams p;
       p.max_iterations = max_iterations;
       p.tolerance = tolerance;
       p.max_correspondence_dist = max_correspondence_dist;
@@ -329,11 +533,11 @@ static void brewpy_static_extra(py::module_& m) {
        py::arg("max_correspondence_dist") = 1e10, py::arg("sigma_sq") = 1.0,
        py::arg("trim_fraction") = 1.0, py::arg("observability_threshold") = 0.0);
 
-  py::class_<template_matching::PcaIcp, template_matching::IcpBase,
-             std::shared_ptr<template_matching::PcaIcp>>(tm, "PcaIcp")
-      .def(py::init([](std::shared_ptr<template_matching::IcpBase> inner,
+  py::class_<utils::registration::PcaIcp, utils::registration::IcpBase,
+             std::shared_ptr<utils::registration::PcaIcp>>(tm, "PcaIcp")
+      .def(py::init([](std::shared_ptr<utils::registration::IcpBase> inner,
                        const Eigen::MatrixXd& source_template) {
-        return std::make_shared<template_matching::PcaIcp>(
-            inner->clone(), template_matching::PointCloud(source_template));
+        return std::make_shared<utils::registration::PcaIcp>(
+            inner->clone(), utils::registration::PointCloud(source_template));
       }), py::arg("inner_icp"), py::arg("source_template"));
 }
