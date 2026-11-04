@@ -249,3 +249,4 @@ in the journal. Other filter and RFS types retain their existing constructors.
 
 The generator reads `@mex_config` field names from the native class and obtains
 each field type with `decltype`; it contains no second set of numeric defaults.
+
